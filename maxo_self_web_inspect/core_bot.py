@@ -130,6 +130,10 @@ CREATE TABLE IF NOT EXISTS deleted_archive (
 """)
 try: db.execute("ALTER TABLE deleted_archive ADD COLUMN deleted_at INTEGER DEFAULT 0")
 except sqlite3.OperationalError: pass
+db.execute("""CREATE TABLE IF NOT EXISTS web_commands (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, command TEXT NOT NULL, payload TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'queued', result TEXT DEFAULT '', created_at INTEGER, finished_at INTEGER
+)""")
 db.commit()
 
 # اگه از نسخه‌ی قبلی یه جدول deleted_archive با ستون‌های قدیمی مونده،
@@ -991,6 +995,7 @@ def stylize_chat_text(value, style):
 # «ذخیره/فوروارد ممنوع» داشت -> دانلود و بعد آپلود در Saved Messages.
 
 EXPORT_STATE = {"running": False, "cancel": False}
+EXPORT_PROGRESS = {"running": False, "target": "", "forwarded": 0, "uploaded": 0, "failed": 0, "label": "", "message": ""}
 EXPORT_BATCH = 100          # تعداد پیام در هر فوروارد دسته‌ای
 CAPTION_LIMIT = 1024        # حد کپشن اکانت عادی
 
@@ -1208,6 +1213,21 @@ async def _process_batch(entity, entity_id, buf, state, stats):
         await asyncio.sleep(0.3)
 
 
+def save_web_export_progress():
+    values = {
+        "web_export_running": "1" if EXPORT_PROGRESS.get("running") else "0",
+        "web_export_target": EXPORT_PROGRESS.get("target", ""),
+        "web_export_label": EXPORT_PROGRESS.get("label", ""),
+        "web_export_forwarded": str(EXPORT_PROGRESS.get("forwarded", 0)),
+        "web_export_uploaded": str(EXPORT_PROGRESS.get("uploaded", 0)),
+        "web_export_failed": str(EXPORT_PROGRESS.get("failed", 0)),
+        "web_export_message": EXPORT_PROGRESS.get("message", ""),
+    }
+    for k, v in values.items():
+        db.execute("INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)", (k, v))
+    db.commit()
+
+
 async def export_chat_content(raw_target, status_msg=None, restart=False, limit=None):
     entity = await resolve_export_target(raw_target)
     entity_id = tl_utils.get_peer_id(entity)
@@ -1218,6 +1238,8 @@ async def export_chat_content(raw_target, status_msg=None, restart=False, limit=
 
     state = {"restricted": bool(getattr(entity, "noforwards", False))}
     stats = {"forwarded": 0, "uploaded": 0, "failed": 0}
+    EXPORT_PROGRESS.update({"running": True, "target": raw_target, "label": label, "forwarded": 0, "uploaded": 0, "failed": 0, "message": "در حال انتقال"})
+    save_web_export_progress()
 
     await tg_retry(client.send_message, "me", f"📥 شروع انتقال از «{label}»" + (f" (ادامه از پیام {last_id})" if last_id else ""))
 
@@ -1234,6 +1256,8 @@ async def export_chat_content(raw_target, status_msg=None, restart=False, limit=
             last_processed = buf[-1].id
             set_setting(key, last_processed)
         buf = []
+        EXPORT_PROGRESS.update(stats)
+        save_web_export_progress()
         if status_msg and time.time() - last_edit > 8:
             last_edit = time.time()
             try:
@@ -1263,6 +1287,10 @@ async def export_chat_content(raw_target, status_msg=None, restart=False, limit=
     if buf and not EXPORT_STATE["cancel"]:
         await flush()
 
+    EXPORT_PROGRESS.update(stats)
+    EXPORT_PROGRESS["running"] = False
+    EXPORT_PROGRESS["message"] = "انتقال متوقف شد" if EXPORT_STATE["cancel"] else "انتقال تمام شد"
+    save_web_export_progress()
     return stats, label
 
 
@@ -1697,6 +1725,100 @@ async def deleted_handler(event):
 
 
 # ============================================================
+# WEB PANEL COMMAND BRIDGE
+# ============================================================
+
+async def _run_web_command(command, payload):
+    global EXPORT_STATE
+    if command in {"block", "unblock", "mute", "unmute"}:
+        value = str(payload.get("user", "")).strip()
+        user = await resolve_user(value)
+        if not user:
+            raise ValueError("کاربر پیدا نشد؛ آیدی یا یوزرنیم را بررسی کن")
+        if command == "block": return await block_user(user)
+        if command == "unblock": return await unblock_user(user)
+        if command == "mute": add_mute(user); return "سکوت برای کاربر فعال شد"
+        remove_mute(user.id); return "سکوت کاربر برداشته شد"
+    if command == "delete_messages":
+        chat_id = int(payload["chat_id"]); count = max(1, min(1000, int(payload.get("count", 1))))
+        ids=[]
+        async for m in client.iter_messages(chat_id, limit=count): ids.append(m.id)
+        for mid in ids: suppress_delete_ids.add(int(mid))
+        if ids: await client.delete_messages(chat_id, ids, revoke=True)
+        return f"{len(ids)} پیام حذف شد"
+    if command == "delete_message":
+        chat_id=int(payload["chat_id"]); mid=int(payload["message_id"])
+        suppress_delete_ids.add(mid); await client.delete_messages(chat_id,[mid],revoke=True)
+        return "پیام انتخاب‌شده حذف شد"
+    if command == "spam":
+        count=max(1,min(30,int(payload.get("count",1)))); body=str(payload.get("text", ""))[:4000]
+        if not body.strip(): raise ValueError("متن پیام خالی است")
+        for _ in range(count): await client.send_message("me",body)
+        return f"{count} پیام در Saved Messages ارسال شد"
+    if command == "name_clock":
+        font=int(payload.get("font",1)); label=str(payload.get("label", "")).strip()
+        ok=await enable_name_clock(font=font if 1<=font<=len(FONT_MAPS) else 1, label=label or None)
+        if not ok: raise RuntimeError("به‌روزرسانی نام انجام نشد")
+        return "ساعت نام فعال شد"
+    if command == "name_clock_off":
+        await disable_name_clock(); return "ساعت نام خاموش شد و نام قبلی بازگشت"
+    if command == "bio_clock":
+        font=int(payload.get("font",1)); ok=await enable_bio_clock(font if 1<=font<=len(FONT_MAPS) else 1)
+        if not ok: raise RuntimeError("به‌روزرسانی بیو انجام نشد")
+        return "ساعت بیو فعال شد"
+    if command == "bio_clock_off":
+        await disable_bio_clock(); return "ساعت بیو خاموش شد و بیوی قبلی بازگشت"
+    if command == "export_start":
+        if EXPORT_STATE["running"]: raise RuntimeError("یک انتقال در حال اجراست")
+        target=str(payload.get("target", "")).strip()
+        if not target: raise ValueError("لینک یا آیدی کانال را وارد کن")
+        limit=payload.get("limit")
+        limit=int(limit) if limit not in (None, "") else None
+        if limit is not None: limit=max(1,min(100000,limit))
+        restart=bool(payload.get("restart",False))
+        EXPORT_STATE.update({"running":True,"cancel":False})
+        EXPORT_PROGRESS.update({"running":True,"target":target,"forwarded":0,"uploaded":0,"failed":0,"label":"","message":"در حال شروع"})
+        save_web_export_progress()
+        async def _do_export():
+            try:
+                stats,label=await export_chat_content(target,None,restart=restart,limit=limit)
+                EXPORT_PROGRESS.update(stats); EXPORT_PROGRESS["label"]=label
+            except Exception as e:
+                EXPORT_PROGRESS["message"]="خطا: "+type(e).__name__+" - "+str(e)[:240]
+                print("WEB EXPORT ERROR:",repr(e))
+            finally:
+                EXPORT_STATE.update({"running":False,"cancel":False}); EXPORT_PROGRESS["running"]=False
+                save_web_export_progress()
+        asyncio.create_task(_do_export())
+        return "انتقال شروع شد"
+    if command == "export_stop":
+        if not EXPORT_STATE["running"]: return "انتقالی در حال اجرا نیست"
+        EXPORT_STATE["cancel"]=True; return "درخواست توقف ثبت شد"
+    if command == "status": return await status()
+    if command == "account_info": return await account_info()
+    raise ValueError("دستور ناشناخته است")
+
+
+async def web_command_loop():
+    while True:
+        try:
+            row=db.execute("SELECT id,command,payload FROM web_commands WHERE status='queued' ORDER BY id LIMIT 1").fetchone()
+            if row:
+                cid,command,payload=row
+                db.execute("UPDATE web_commands SET status='running' WHERE id=?",(cid,)); db.commit()
+                try:
+                    result=await _run_web_command(command,json.loads(payload or "{}"))
+                    db.execute("UPDATE web_commands SET status='done',result=?,finished_at=? WHERE id=?",(str(result)[:4000],int(time.time()),cid))
+                except Exception as e:
+                    db.execute("UPDATE web_commands SET status='error',result=?,finished_at=? WHERE id=?",(f"{type(e).__name__}: {str(e)[:1000]}",int(time.time()),cid))
+                db.commit()
+            else:
+                await asyncio.sleep(0.7)
+        except Exception as e:
+            print("WEB COMMAND LOOP ERROR:",repr(e)); await asyncio.sleep(2)
+
+
+# ============================================================
 # START
 # ============================================================
 
@@ -1724,6 +1846,7 @@ async def main():
 
     asyncio.create_task(clock_loop())
     asyncio.create_task(archive_cleanup_loop())
+    asyncio.create_task(web_command_loop())
 
     try:
         await client.send_message(
