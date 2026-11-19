@@ -1,1 +1,4 @@
-fastapi>=0.110,<1\nuvicorn[standard]>=0.27,<1\ntelethon>=1.36,<2\npydantic>=2,<3\n
+fastapi>=0.110,<1
+uvicorn[standard]>=0.27,<1
+telethon>=1.36,<2
+pydantic>=2,<3
